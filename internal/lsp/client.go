@@ -13,14 +13,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/isaacphi/mcp-language-server/internal/protocol"
+	"github.com/beesmart-app/mcp-language-server/internal/protocol"
 )
 
 type Client struct {
-	Cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout *bufio.Reader
-	stderr io.ReadCloser
+	Cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	stdinMu sync.Mutex
+	stdout  *bufio.Reader
+	stderr  io.ReadCloser
 
 	// Request ID counter
 	nextID atomic.Int32

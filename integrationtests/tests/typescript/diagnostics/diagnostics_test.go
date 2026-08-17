@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/isaacphi/mcp-language-server/integrationtests/tests/common"
-	"github.com/isaacphi/mcp-language-server/integrationtests/tests/typescript/internal"
-	"github.com/isaacphi/mcp-language-server/internal/protocol"
-	"github.com/isaacphi/mcp-language-server/internal/tools"
+	"github.com/beesmart-app/mcp-language-server/integrationtests/tests/common"
+	"github.com/beesmart-app/mcp-language-server/integrationtests/tests/typescript/internal"
+	"github.com/beesmart-app/mcp-language-server/internal/protocol"
+	"github.com/beesmart-app/mcp-language-server/internal/tools"
 )
 
 // TestDiagnostics tests diagnostics functionality with the TypeScript language server

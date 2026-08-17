@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/isaacphi/mcp-language-server/internal/protocol"
-	"github.com/isaacphi/mcp-language-server/internal/watcher"
+	"github.com/beesmart-app/mcp-language-server/internal/protocol"
+	"github.com/beesmart-app/mcp-language-server/internal/watcher"
 )
 
 // FileEvent represents a file event notification
