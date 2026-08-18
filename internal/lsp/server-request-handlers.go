@@ -20,8 +20,36 @@ func RegisterFileWatchHandler(handler FileWatchHandler) {
 
 // Requests
 
+// javaSettingsOverrides sobrescreve defaults do Eclipse JDT LS que desabilitam
+// funcionalidade util quando o cliente (aqui) nao responde workspace/configuration
+// com um valor real. Sem isso, jdtls usa seu default interno para cada
+// configuracao pedida - e o default de java.symbols.includeSourceMethodDeclarations
+// e false, entao workspace/symbol (usado por FindDefinition/FindReferences) nunca
+// retorna metodos/campos, so tipos (classes/interfaces/enums).
+var javaSettingsOverrides = map[string]any{
+	"symbols": map[string]any{
+		"includeSourceMethodDeclarations": true,
+	},
+}
+
 func HandleWorkspaceConfiguration(params json.RawMessage) (any, error) {
-	return []map[string]any{{}}, nil
+	var configParams protocol.ConfigurationParams
+	if err := json.Unmarshal(params, &configParams); err != nil || len(configParams.Items) == 0 {
+		return []map[string]any{{}}, nil
+	}
+
+	result := make([]any, len(configParams.Items))
+	for i, item := range configParams.Items {
+		switch item.Section {
+		case "java":
+			result[i] = javaSettingsOverrides
+		case "java.symbols.includeSourceMethodDeclarations":
+			result[i] = true
+		default:
+			result[i] = map[string]any{}
+		}
+	}
+	return result, nil
 }
 
 func HandleRegisterCapability(params json.RawMessage) (any, error) {
