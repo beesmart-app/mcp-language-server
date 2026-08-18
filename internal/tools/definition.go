@@ -11,7 +11,7 @@ import (
 
 func ReadDefinition(ctx context.Context, client *lsp.Client, symbolName string) (string, error) {
 	symbolResult, err := client.Symbol(ctx, protocol.WorkspaceSymbolParams{
-		Query: symbolName,
+		Query: symbolQueryTerm(symbolName),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch symbol: %v", err)
@@ -39,8 +39,25 @@ func ReadDefinition(ctx context.Context, client *lsp.Client, symbolName string) 
 
 			// Handle different matching strategies based on the search term
 			if strings.Contains(symbolName, ".") {
-				// For qualified names like "Type.Method", require exact match
-				if symbol.GetName() != symbolName {
+				// For qualified names like "Type.Method": workspace/symbol
+				// results normally carry just the bare name ("Method"), not
+				// "Type.Method", so match either form (bare name, or
+				// Type::Method/Type.Method suffix in case some server does
+				// return the qualified form).
+				parts := strings.Split(symbolName, ".")
+				bareName := parts[len(parts)-1]
+				typeQualifier := strings.Join(parts[:len(parts)-1], ".")
+				if symbol.GetName() != symbolName && symbol.GetName() != bareName &&
+					!strings.HasSuffix(symbol.GetName(), "::"+bareName) && !strings.HasSuffix(symbol.GetName(), "."+bareName) {
+					continue
+				}
+				// Bare-name matching alone is ambiguous for common method
+				// names shared by many types (e.g. "setActiveTab" declared
+				// in dozens of classes). When we know the container, require
+				// it to match the given type qualifier so "Type.Method"
+				// actually narrows down to that type.
+				if v.ContainerName != "" && typeQualifier != "" &&
+					v.ContainerName != typeQualifier && !strings.HasSuffix(v.ContainerName, "."+typeQualifier) {
 					continue
 				}
 			} else {

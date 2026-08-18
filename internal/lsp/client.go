@@ -188,6 +188,19 @@ func (c *Client) InitializeLSPClient(ctx context.Context, workspaceDir string) (
 					"vendor":             true,
 					"vulncheck":          false,
 				},
+				// Eclipse JDT LS le configuracoes iniciais em
+				// initializationOptions.settings.java.* (mesmo canal que o
+				// vscode-java usa). Sem isso ele usa seus defaults internos -
+				// e o default de includeSourceMethodDeclarations e false, o
+				// que faz workspace/symbol (usado por FindDefinition e
+				// FindReferences) nunca retornar metodos/campos, so tipos.
+				"settings": map[string]any{
+					"java": map[string]any{
+						"symbols": map[string]any{
+							"includeSourceMethodDeclarations": true,
+						},
+					},
+				},
 			},
 		},
 	}

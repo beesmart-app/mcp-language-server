@@ -11,6 +11,21 @@ import (
 	"github.com/beesmart-app/mcp-language-server/internal/protocol"
 )
 
+// symbolQueryTerm extrai o termo que deve ir na query de workspace/symbol
+// enviada ao language server. Um nome qualificado como "Type.Method" e um
+// recurso deste tool (para desambiguar entre metodos de mesmo nome), nao do
+// protocolo LSP: o language server faz fuzzy match textual contra nomes de
+// simbolo (que normalmente sao so o nome, ex. "Method", sem o "Type."), e um
+// "." no meio da query costuma zerar os resultados. Por isso so o ultimo
+// segmento vai para a query; o restante e usado so para filtrar os
+// resultados depois (ver ReadDefinition/FindReferences).
+func symbolQueryTerm(symbolName string) string {
+	if idx := strings.LastIndex(symbolName, "."); idx != -1 {
+		return symbolName[idx+1:]
+	}
+	return symbolName
+}
+
 // Gets the full code block surrounding the start of the input location
 func GetFullDefinition(ctx context.Context, client *lsp.Client, startLocation protocol.Location) (string, protocol.Location, error) {
 	symParams := protocol.DocumentSymbolParams{

@@ -23,7 +23,7 @@ func FindReferences(ctx context.Context, client *lsp.Client, symbolName string) 
 
 	// First get the symbol location like ReadDefinition does
 	symbolResult, err := client.Symbol(ctx, protocol.WorkspaceSymbolParams{
-		Query: symbolName,
+		Query: symbolQueryTerm(symbolName),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch symbol: %v", err)
@@ -41,9 +41,20 @@ func FindReferences(ctx context.Context, client *lsp.Client, symbolName string) 
 			// For qualified names like "Type.Method", check for various matches
 			parts := strings.Split(symbolName, ".")
 			methodName := parts[len(parts)-1]
+			typeQualifier := strings.Join(parts[:len(parts)-1], ".")
 
 			// Try matching the unqualified method name for languages that don't use qualified names in symbols
 			if symbol.GetName() != symbolName && symbol.GetName() != methodName {
+				continue
+			}
+			// Bare-name matching alone is ambiguous for common method names
+			// shared by many types (e.g. "setActiveTab" declared in dozens
+			// of classes). When we know the container, require it to match
+			// the given type qualifier so "Type.Method" actually narrows
+			// down to that type instead of returning references to every
+			// same-named method in the codebase.
+			if si, ok := symbol.(*protocol.SymbolInformation); ok && si.ContainerName != "" && typeQualifier != "" &&
+				si.ContainerName != typeQualifier && !strings.HasSuffix(si.ContainerName, "."+typeQualifier) {
 				continue
 			}
 		} else if symbol.GetName() != symbolName {
