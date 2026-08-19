@@ -26,9 +26,24 @@ func GetDiagnosticsForFile(ctx context.Context, client *lsp.Client, filePath str
 		return "", fmt.Errorf("could not open file: %v", err)
 	}
 
+	// OpenFile is a no-op if the file was already open from an earlier
+	// call in this session. Without an explicit re-sync here, diagnostics
+	// would depend entirely on the background file watcher having already
+	// caught and forwarded any edits made since - a race that silently
+	// serves stale diagnostics when the watcher hasn't caught up yet.
+	if err := client.NotifyChange(ctx, filePath); err != nil {
+		return "", fmt.Errorf("could not sync file: %v", err)
+	}
+
 	// Wait for diagnostics
 	// TODO: wait for notification
-	time.Sleep(time.Second * 3)
+	waitTime := time.Second * 3
+	if envWait := os.Getenv("LSP_DIAGNOSTICS_WAIT_SECONDS"); envWait != "" {
+		if val, err := strconv.Atoi(envWait); err == nil && val >= 0 {
+			waitTime = time.Duration(val) * time.Second
+		}
+	}
+	time.Sleep(waitTime)
 
 	// Convert the file path to URI format
 	uri := protocol.DocumentUri("file://" + filePath)
