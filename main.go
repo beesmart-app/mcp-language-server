@@ -4,10 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,6 +27,8 @@ type config struct {
 	workspaceDir string
 	lspCommand   string
 	lspArgs      []string
+	listenSocket string
+	idleTimeout  time.Duration
 }
 
 type mcpServer struct {
@@ -33,12 +38,23 @@ type mcpServer struct {
 	ctx              context.Context
 	cancelFunc       context.CancelFunc
 	workspaceWatcher *watcher.WorkspaceWatcher
+
+	// Estado do modo daemon (config.listenSocket != ""): contador de sessoes
+	// SSE ativas e timer de encerramento por ociosidade. Nao usado no modo
+	// stdio de sessao unica (1 processo por sessao, sem conceito de "sessao
+	// ativa" separado do proprio processo).
+	idleShutdown chan struct{}
+	sessionMu    sync.Mutex
+	activeCount  int
+	idleTimer    *time.Timer
 }
 
 func parseConfig() (*config, error) {
 	cfg := &config{}
 	flag.StringVar(&cfg.workspaceDir, "workspace", "", "Path to workspace directory")
 	flag.StringVar(&cfg.lspCommand, "lsp", "", "LSP command to run (args should be passed after --)")
+	flag.StringVar(&cfg.listenSocket, "listen", "", "Unix socket path to serve MCP over SSE for multiple concurrent clients (daemon mode). Empty (default): serve a single client over stdio, as before.")
+	flag.DurationVar(&cfg.idleTimeout, "idle-timeout", 20*time.Minute, "Daemon mode only (-listen): shut down after this long with zero connected sessions.")
 	flag.Parse()
 
 	// Get remaining args after -- as LSP arguments
@@ -74,9 +90,10 @@ func parseConfig() (*config, error) {
 func newServer(config *config) (*mcpServer, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &mcpServer{
-		config:     *config,
-		ctx:        ctx,
-		cancelFunc: cancel,
+		config:       *config,
+		ctx:          ctx,
+		cancelFunc:   cancel,
+		idleShutdown: make(chan struct{}),
 	}, nil
 }
 
@@ -108,19 +125,86 @@ func (s *mcpServer) start() error {
 		return err
 	}
 
-	s.mcpServer = server.NewMCPServer(
-		"MCP Language Server",
-		"v0.0.2",
+	opts := []server.ServerOption{
 		server.WithLogging(),
 		server.WithRecovery(),
-	)
+	}
+	if s.config.listenSocket != "" {
+		opts = append(opts, server.WithHooks(s.idleTimeoutHooks()))
+	}
+	s.mcpServer = server.NewMCPServer("MCP Language Server", "v0.0.2", opts...)
 
 	err := s.registerTools()
 	if err != nil {
 		return fmt.Errorf("tool registration failed: %v", err)
 	}
 
+	if s.config.listenSocket != "" {
+		return s.serveDaemon()
+	}
 	return server.ServeStdio(s.mcpServer)
+}
+
+// serveDaemon serve MCP sobre SSE num socket Unix, permitindo multiplas
+// sessoes (bridges stdio de varias sessoes Claude Code) compartilharem o
+// mesmo lsp.Client/jdtls. baseURL "http://unix" e so um placeholder valido
+// pra montar o endpoint de mensagem absoluto que o SSEServer manda pro
+// cliente - quem consome esse endpoint (cmd/bridge) ignora o host real e
+// disca sempre no socket via DialContext customizado.
+func (s *mcpServer) serveDaemon() error {
+	_ = os.Remove(s.config.listenSocket)
+	listener, err := net.Listen("unix", s.config.listenSocket)
+	if err != nil {
+		return fmt.Errorf("failed to listen on unix socket %s: %v", s.config.listenSocket, err)
+	}
+	defer listener.Close()
+	defer os.Remove(s.config.listenSocket)
+
+	sseServer := server.NewSSEServer(s.mcpServer, server.WithBaseURL("http://unix"))
+	coreLogger.Info("Serving MCP over SSE on unix socket: %s (idle timeout: %s)", s.config.listenSocket, s.config.idleTimeout)
+	return http.Serve(listener, sseServer)
+}
+
+// idleTimeoutHooks arma/desarma um timer de encerramento por ociosidade:
+// zera o timer quando uma sessao entra, arma quando a ultima sessao sai.
+// So faz sentido no modo daemon (sessao == conexao SSE de um bridge) - no
+// modo stdio de sessao unica o proprio processo morre com a sessao, sem
+// precisar de timer.
+func (s *mcpServer) idleTimeoutHooks() *server.Hooks {
+	hooks := &server.Hooks{}
+	hooks.AddOnRegisterSession(func(ctx context.Context, session server.ClientSession) {
+		s.sessionMu.Lock()
+		defer s.sessionMu.Unlock()
+		s.activeCount++
+		if s.idleTimer != nil {
+			s.idleTimer.Stop()
+			s.idleTimer = nil
+		}
+		coreLogger.Info("Session registered (%s), active=%d", session.SessionID(), s.activeCount)
+	})
+	hooks.AddOnUnregisterSession(func(ctx context.Context, session server.ClientSession) {
+		s.sessionMu.Lock()
+		defer s.sessionMu.Unlock()
+		if s.activeCount > 0 {
+			s.activeCount--
+		}
+		coreLogger.Info("Session unregistered (%s), active=%d", session.SessionID(), s.activeCount)
+		if s.activeCount == 0 {
+			if s.idleTimer != nil {
+				s.idleTimer.Stop()
+			}
+			idleTimeout := s.config.idleTimeout
+			s.idleTimer = time.AfterFunc(idleTimeout, func() {
+				coreLogger.Info("Idle timeout (%s) reached with no active sessions, shutting down", idleTimeout)
+				select {
+				case <-s.idleShutdown: // ja fechado
+				default:
+					close(s.idleShutdown)
+				}
+			})
+		}
+	})
+	return hooks
 }
 
 func main() {
@@ -144,39 +228,59 @@ func main() {
 	parentDeath := make(chan struct{})
 
 	// Monitor parent process termination
-	// Claude desktop does not properly kill child processes for MCP servers
-	go func() {
-		ppid := os.Getppid()
-		coreLogger.Debug("Monitoring parent process: %d", ppid)
+	// Claude desktop does not properly kill child processes for MCP servers.
+	// So faz sentido pra sessao stdio unica (1 processo por sessao) - um
+	// daemon (-listen) deve sobreviver a qualquer sessao individual que o
+	// tenha iniciado, entao esse monitor fica desligado nesse modo.
+	if config.listenSocket == "" {
+		go func() {
+			ppid := os.Getppid()
+			coreLogger.Debug("Monitoring parent process: %d", ppid)
 
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
 
-		for {
-			select {
-			case <-ticker.C:
-				currentPpid := os.Getppid()
-				if currentPpid != ppid && (currentPpid == 1 || ppid == 1) {
-					coreLogger.Info("Parent process %d terminated (current ppid: %d), initiating shutdown", ppid, currentPpid)
-					close(parentDeath)
+			for {
+				select {
+				case <-ticker.C:
+					currentPpid := os.Getppid()
+					if currentPpid != ppid && (currentPpid == 1 || ppid == 1) {
+						coreLogger.Info("Parent process %d terminated (current ppid: %d), initiating shutdown", ppid, currentPpid)
+						close(parentDeath)
+						return
+					}
+				case <-done:
 					return
 				}
-			case <-done:
-				return
 			}
-		}
-	}()
+		}()
+	}
 
-	// Handle shutdown triggers
+	// Handle shutdown triggers. cleanup() so encerra o lado LSP (fecha
+	// arquivos, manda shutdown/exit pro jdtls) - nao faz o processo em si
+	// terminar. No modo stdio original isso "funcionava" so porque
+	// ServeStdio costuma desbloquear/o processo eventualmente leva SIGKILL
+	// de quem gerencia (comentario acima ja apontava que o Claude
+	// desktop/Code nao mata direito processos filhos de MCP server). No
+	// modo daemon isso e um bug real: http.Serve nunca desbloqueia sozinho,
+	// entao sem os.Exit explicito aqui o processo fica vivo pra sempre
+	// segurando o lock/socket mesmo depois do idle-timeout "completar".
+	// Chamar os.Exit aqui (em vez de confiar no fluxo sequencial abaixo
+	// alcancar <-done) garante saida em qualquer um dos tres modos.
 	go func() {
 		select {
 		case sig := <-sigChan:
 			coreLogger.Info("Received signal %v in PID: %d", sig, os.Getpid())
 			cleanup(server, done)
+		case <-server.idleShutdown:
+			coreLogger.Info("Idle shutdown triggered")
+			cleanup(server, done)
 		case <-parentDeath:
 			coreLogger.Info("Parent death detected, initiating shutdown")
 			cleanup(server, done)
 		}
+		coreLogger.Info("Server shutdown complete for PID: %d", os.Getpid())
+		os.Exit(0)
 	}()
 
 	if err := server.start(); err != nil {
