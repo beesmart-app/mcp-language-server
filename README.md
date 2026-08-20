@@ -176,6 +176,39 @@ This is an [MCP](https://modelcontextprotocol.io/introduction) server that runs 
 - `rename_symbol`: Rename a symbol across a project.
 - `edit_file`: Allows making multiple text edits to a file based on line numbers. Provides a more reliable and context-economical way to edit files compared to search and replace based edit tools.
 
+## This fork (beesmart-app/mcp-language-server)
+
+This is a fork of [isaacphi/mcp-language-server](https://github.com/isaacphi/mcp-language-server) with fixes and one new feature that hadn't landed upstream as of `v0.1.1`. Module path and binary name are unchanged, so it's a drop-in replacement.
+
+**Fixes** (each is a separate tag, `v0.1.1-beesmart.N`):
+
+1. **Write mutex**: `WriteMessage` wrote the `Content-Length` header and JSON body to `stdin` in two separate calls with no lock. Under concurrent writers (e.g. a burst of `workspace/didChangeWatchedFiles` racing a tool call response), bytes interleaved on the pipe and the language server lost LSP framing sync, entering a "Missing header Content-Length" error loop that degrades or kills the connection.
+2. **`workspace/symbol` for methods**: `HandleWorkspaceConfiguration` answered every config request with `{}`, so `java.symbols.includeSourceMethodDeclarations` (default `false` in Eclipse JDT LS) never got enabled and symbol search only ever returned types. Separately, qualified names (`Type.Method`, the format the tool itself documents) were sent to the server with a literal `.`, which the server's fuzzy matcher doesn't understand and returns empty for — fixed by searching on the method name alone and filtering by container name client-side.
+3. **Hover with legacy `MarkedString[]`**: some servers (jdtls included) sometimes reply to `hover` with the legacy LSP array-of-`MarkedString` format instead of modern `MarkupContent`, which the generated type only accepted one of. Fixed with a custom `UnmarshalJSON` that accepts both.
+4. **Stale diagnostics after external edits**: `GetDiagnosticsForFile` called `OpenFile`, a no-op if the file was already open in this session, then a flat `time.Sleep(3s)` before reading a diagnostics cache that's only updated asynchronously by the file watcher. If the watcher hadn't caught up to an edit within 3s (easy on a larger project, or edits in quick succession), the tool silently served pre-edit diagnostics with no versioning to catch it. Fixed by forcing a `NotifyChange` unconditionally before waiting, and made the wait configurable via `LSP_DIAGNOSTICS_WAIT_SECONDS` (same pattern as `LSP_CONTEXT_LINES`) since 3s isn't always enough under load.
+5. **Daemon mode** (`v0.1.1-beesmart.6`) — see below.
+
+### Daemon mode: sharing one language server across multiple MCP clients
+
+By default (as upstream), this binary serves MCP over stdio: one process per client, 1:1. If several MCP clients (e.g. several editor windows/sessions) point at the same `-workspace`, each spawns its own language server — for a stateful server like jdtls this means duplicate JVMs and, worse, multiple processes writing to the same on-disk language-server workspace/index with no coordination (we hit real index corruption this way).
+
+New flags let one process serve many clients concurrently instead:
+
+- `-listen <unix-socket-path>`: instead of `ServeStdio`, serve MCP over SSE (`server.NewSSEServer`, from `mark3labs/mcp-go`) on a Unix domain socket. All connected clients share the same `*lsp.Client` / language server process — tools are registered once, over that shared client. In this mode the parent-process watchdog is disabled (a daemon must outlive any single client that started it).
+- `-idle-timeout <duration>` (default `20m`, daemon mode only): shuts down gracefully (closes files, sends LSP `shutdown`/`exit`) after this long with zero connected clients, using the `OnRegisterSession`/`OnUnregisterSession` hooks to track active sessions.
+
+`cmd/bridge` is a small, protocol-generic companion binary (no language-specific logic) that speaks MCP-over-stdio on one side (so it's still a normal stdio "command" from the client's point of view) and MCP-over-SSE to a daemon's Unix socket on the other, forwarding `ListTools`/`CallTool` 1:1. This lets you keep a stdio-based MCP client config unchanged while multiple client processes share one backend:
+
+```bash
+# once, or lazily on first use - start (or reuse) the shared daemon:
+mcp-language-server -workspace /path/to/project -listen /run/user/$UID/my-project.sock -idle-timeout 20m -lsp gopls &
+
+# each client's MCP config points at the bridge instead of the daemon directly:
+# "command": "mcp-language-server-bridge", "args": ["-socket", "/run/user/1000/my-project.sock"]
+```
+
+Bootstrapping (deciding whether a daemon is already up, starting one detached if not, and waiting for the socket to become live) is left to the caller — this repo doesn't ship a supervisor for that. Note the ~108-byte `sun_path` limit on Unix sockets: keep the socket path short (e.g. under `$XDG_RUNTIME_DIR`) rather than nesting it inside a possibly-deep workspace/data directory.
+
 ## About
 
 This codebase makes use of edited code from [gopls](https://go.googlesource.com/tools/+/refs/heads/master/gopls/internal/protocol) to handle LSP communication. See ATTRIBUTION for details. Everything here is covered by a permissive BSD style license.
