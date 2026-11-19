@@ -44,9 +44,12 @@ type mcpServer struct {
 	// stdio de sessao unica (1 processo por sessao, sem conceito de "sessao
 	// ativa" separado do proprio processo).
 	idleShutdown chan struct{}
-	sessionMu    sync.Mutex
-	activeCount  int
-	idleTimer    *time.Timer
+	// Fechado quando o processo LSP morre depois de inicializado. Sem isso o
+	// daemon (-listen) seguia vivo sem LSP, com socket inutil, ate alguem matar.
+	lspDied     chan struct{}
+	sessionMu   sync.Mutex
+	activeCount int
+	idleTimer   *time.Timer
 }
 
 func parseConfig() (*config, error) {
@@ -94,6 +97,7 @@ func newServer(config *config) (*mcpServer, error) {
 		ctx:          ctx,
 		cancelFunc:   cancel,
 		idleShutdown: make(chan struct{}),
+		lspDied:      make(chan struct{}),
 	}, nil
 }
 
@@ -108,6 +112,10 @@ func (s *mcpServer) initializeLSP() error {
 	}
 	s.lspClient = client
 	s.workspaceWatcher = watcher.NewWorkspaceWatcher(client)
+	go func() {
+		<-client.Exited()
+		close(s.lspDied)
+	}()
 
 	initResult, err := client.InitializeLSPClient(s.ctx, s.config.workspaceDir)
 	if err != nil {
@@ -278,6 +286,10 @@ func main() {
 		case <-parentDeath:
 			coreLogger.Info("Parent death detected, initiating shutdown")
 			cleanup(server, done)
+		case <-server.lspDied:
+			coreLogger.Error("LSP process exited, shutting down so the next session starts a fresh one")
+			cleanup(server, done)
+			os.Exit(1)
 		}
 		coreLogger.Info("Server shutdown complete for PID: %d", os.Getpid())
 		os.Exit(0)

@@ -96,6 +96,7 @@ func ReadMessage(r *bufio.Reader) (*Message, error) {
 
 // handleMessages reads and dispatches messages in a loop
 func (c *Client) handleMessages() {
+	defer c.markExited()
 	for {
 		msg, err := ReadMessage(c.stdout)
 		if err != nil {

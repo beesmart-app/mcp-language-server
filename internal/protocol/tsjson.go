@@ -3034,7 +3034,10 @@ func (t *Or_WorkspaceOptions_textDocumentContent) UnmarshalJSON(x []byte) error 
 		t.Value = h200
 		return nil
 	}
-	return &UnmarshalError{"unmarshal failed to match one of [TextDocumentContentOptions TextDocumentContentRegistrationOptions]"}
+	// jdtls 1.58+ manda o formato final do LSP 3.18 ("schemes": [...]), diferente
+	// do proposto gerado aqui ("scheme"). A capacidade nao e usada: ignora.
+	t.Value = nil
+	return nil
 }
 
 func (t Or_WorkspaceSymbol_location) MarshalJSON() ([]byte, error) {

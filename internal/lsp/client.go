@@ -45,6 +45,20 @@ type Client struct {
 	// Files are currently opened by the LSP
 	openFiles   map[string]*OpenFileInfo
 	openFilesMu sync.RWMutex
+
+	// Fechado quando a leitura do stdout do LSP termina (processo morreu
+	// ou fechou a conexao).
+	exited     chan struct{}
+	exitedOnce sync.Once
+}
+
+// Exited fecha quando a conexao com o processo LSP termina.
+func (c *Client) Exited() <-chan struct{} {
+	return c.exited
+}
+
+func (c *Client) markExited() {
+	c.exitedOnce.Do(func() { close(c.exited) })
 }
 
 func NewClient(command string, args ...string) (*Client, error) {
@@ -95,6 +109,8 @@ func NewClient(command string, args ...string) (*Client, error) {
 			lspLogger.Error("Error reading LSP server stderr: %v", err)
 		}
 	}()
+
+	client.exited = make(chan struct{})
 
 	// Start message handling loop
 	go client.handleMessages()
@@ -205,9 +221,19 @@ func (c *Client) InitializeLSPClient(ctx context.Context, workspaceDir string) (
 		},
 	}
 
-	var result protocol.InitializeResult
-	if err := c.Call(ctx, "initialize", initParams, &result); err != nil {
+	// O resultado do initialize so serve para log das capacidades. Language
+	// servers novos anunciam capacidades que os tipos gerados daqui ainda
+	// nao conhecem (ex.: textDocumentContent do LSP 3.18 no jdtls 1.58) e a
+	// decodificacao estrita derrubava o initialize inteiro. Falha de decode
+	// vira aviso; so erro de transporte/resposta de erro aborta.
+	var raw json.RawMessage
+	if err := c.Call(ctx, "initialize", initParams, &raw); err != nil {
 		return nil, fmt.Errorf("initialize failed: %w", err)
+	}
+	var result protocol.InitializeResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		lspLogger.Warn("initialize: capacidades do servidor nao decodificadas, seguindo sem elas: %v", err)
+		result = protocol.InitializeResult{}
 	}
 
 	if err := c.Notify(ctx, "initialized", struct{}{}); err != nil {
@@ -251,6 +277,8 @@ func (c *Client) Close() error {
 
 	// Force kill the LSP process if it doesn't exit within timeout
 	forcedKill := make(chan struct{})
+	var forcedKillOnce sync.Once
+	stopForcedKill := func() { forcedKillOnce.Do(func() { close(forcedKill) }) }
 	go func() {
 		select {
 		case <-time.After(2 * time.Second):
@@ -262,7 +290,7 @@ func (c *Client) Close() error {
 					lspLogger.Info("Process killed successfully")
 				}
 			}
-			close(forcedKill)
+			stopForcedKill()
 		case <-forcedKill:
 			// Channel closed from completion path
 			return
@@ -276,7 +304,7 @@ func (c *Client) Close() error {
 
 	// Wait for process to exit
 	err := c.Cmd.Wait()
-	close(forcedKill) // Stop the force kill goroutine
+	stopForcedKill() // Stop the force kill goroutine
 
 	return err
 }
